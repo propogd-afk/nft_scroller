@@ -1,0 +1,28 @@
+# ПРОСТОЙ КОНФИГ - ТОЛЬКО ЦЕНА
+# Этот файл можешь менять прямо во время работы бота через команду /setprice
+
+# Диапазон цен в TON - ГЛАВНЫЙ ФИЛЬТР
+min_price: 0.5
+max_price: 10.0
+
+# Интервал проверки в секундах
+check_interval: 20
+
+# Сколько подарков брать за раз с маркета (макс 20)
+limit: 20
+
+# Дополнительно (не обязательно) - можно оставить пустыми
+collections: []  # ["Plush Pepe", "Durov's Cap"] - пусто = все
+models: []       # ["Albino", "Precious"] - пусто = все
+backdrops: []    # ["Onyx Black", "Midnight Black"]
+symbols: []      # ["Coin", "Ice"]
+
+# Статусы: занят / на продаже / гибрид
+# как в прошлом боте
+status_filter:
+  allowed: ["on_sale", "free"]  # on_sale = на продаже, free = свободен, occupied = занят, hybrid = гибрид
+  exclude_locked: false
+
+# Файл базы где хранятся уже виденные подарки (чтобы не спамить)
+db_path: "simple_seen.db"
+chats_db: "chats.db"
