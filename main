@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+ПРОСТОЙ БОТ ДЛЯ ПАРСИНГА NFT ПОД ЦЕНЕ
+- Только цена от/до, которую ты сам ставишь
+- Без ручной возни с биржами - использует твой api_id/api_hash для авто-авторизации в MRKT
+- Фильтр по статусу: занят / на продаже / гибрид
+
+Твои данные из .env: BOT_TOKEN, API_ID, API_HASH
+"""
+
+import asyncio
+import os
+import logging
+import yaml
+import aiosqlite
+from datetime import datetime
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message
+
+from amrkt import MarketClient
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # может быть пустым - тогда подписываем через /start
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger("simple")
+
+CONFIG_PATH = "config.yaml"
+
+def load_config():
+    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+# === STORAGE ДЛЯ ЧАТОВ И ВИДЕННЫХ ПОДАРКОВ ===
+class SimpleStorage:
+    def __init__(self, db_path="simple_seen.db", chats_db="chats.db"):
+        self.db_path = db_path
+        self.chats_db = chats_db
+    
+    async def init(self):
+        # seen gifts
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS seen (
+                    gift_id TEXT PRIMARY KEY,
+                    seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.commit()
+        # chats
+        async with aiosqlite.connect(self.chats_db) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.commit()
+
+    async def is_seen(self, gid: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT 1 FROM seen WHERE gift_id=?", (gid,)) as cur:
+                return await cur.fetchone() is not None
+    
+    async def mark_seen(self, gid: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("INSERT OR REPLACE INTO seen (gift_id, seen_at) VALUES (?, ?)", (gid, datetime.utcnow()))
+            await db.commit()
+
+    async def add_chat(self, chat_id: int, username: str = ""):
+        async with aiosqlite.connect(self.chats_db) as db:
+            await db.execute("INSERT OR REPLACE INTO chats (chat_id, username) VALUES (?, ?)", (chat_id, username))
+            await db.commit()
+
+    async def remove_chat(self, chat_id: int):
+        async with aiosqlite.connect(self.chats_db) as db:
+            await db.execute("DELETE FROM chats WHERE chat_id=?", (chat_id,))
+            await db.commit()
+
+    async def get_all_chats(self):
+        async with aiosqlite.connect(self.chats_db) as db:
+            async with db.execute("SELECT chat_id FROM chats") as cur:
+                rows = await cur.fetchall()
+                return [r[0] for r in rows]
+
+storage = SimpleStorage()
+
+# === ПАРСИНГ ===
+def gift_matches_status(gift, allowed_statuses):
+    """Проверка статуса: занят / на продаже / гибрид"""
+    if not allowed_statuses or "any" in allowed_statuses:
+        return True
+    
+    tags = []
+    if gift.is_on_sale:
+        tags.append("on_sale")
+    if gift.is_on_auction:
+        tags.append("auction")
+    if gift.is_locked:
+        tags.append("locked")
+        tags.append("occupied")
+    if getattr(gift, 'is_hosted', False):
+        tags.append("hosted")
+        tags.append("occupied")
+    if gift.is_crafted:
+        tags.append("crafted")
+    if gift.is_on_sale and gift.is_on_auction:
+        tags.append("hybrid")
+    if (gift.is_crafted or getattr(gift, 'craftable', False)) and gift.is_on_sale:
+        tags.append("hybrid")
+    if not tags:
+        tags.append("free")
+    else:
+        if not gift.is_locked and not getattr(gift, 'is_hosted', False):
+            tags.append("free")
+    
+    return any(s in tags for s in allowed_statuses)
+
+async def search_gifts(market_client: MarketClient, cfg):
+    """Ищет подарки по твоему ценовому диапазону"""
+    min_price = cfg.get("min_price")
+    max_price = cfg.get("max_price")
+    
+    min_nano = int(min_price * 1e9) if min_price is not None else None
+    max_nano = int(max_price * 1e9) if max_price is not None else None
+
+    try:
+        gifts = await market_client.search_gifts(
+            collection_names=cfg.get("collections", []),
+            model_names=cfg.get("models", []),
+            backdrop_names=cfg.get("backdrops", []),
+            symbol_names=cfg.get("symbols", []),
+            min_price=min_nano,
+            max_price=max_nano,
+            ordering="Price",
+            low_to_high=True,
+            count=cfg.get("limit", 20)
+        )
+        return gifts.items if hasattr(gifts, 'items') else gifts
+    except Exception as e:
+        logger.error(f"Ошибка поиска MRKT: {e}")
+        return []
+
+def format_gift_msg(gift):
+    """Красивое сообщение"""
+    price = getattr(gift, 'sale_price_ton', 0) or (getattr(gift, 'sale_price', 0) / 1e9 if getattr(gift, 'sale_price', None) else 0)
+    
+    model_r = getattr(gift, 'model_rarity_percent', None) or (getattr(gift, 'model_rarity_per_mille', 0) / 10 if getattr(gift, 'model_rarity_per_mille', None) else None)
+    back_r = getattr(gift, 'backdrop_rarity_percent', None) or (getattr(gift, 'backdrop_rarity_per_mille', 0) / 10 if getattr(gift, 'backdrop_rarity_per_mille', None) else None)
+    sym_r = getattr(gift, 'symbol_rarity_percent', None) or (getattr(gift, 'symbol_rarity_per_mille', 0) / 10 if getattr(gift, 'symbol_rarity_per_mille', None) else None)
+
+    coll = getattr(gift, 'collection_title', '') or getattr(gift, 'collection_name', '') or getattr(gift, 'title', 'Gift')
+    number = getattr(gift, 'number', '')
+    model = getattr(gift, 'model_title', '') or getattr(gift, 'model_name', '')
+    backdrop = getattr(gift, 'backdrop_title', '') or getattr(gift, 'backdrop_name', '')
+    symbol = getattr(gift, 'symbol_title', '') or getattr(gift, 'symbol_name', '')
+
+    # Статус
+    tags = []
+    if getattr(gift, 'is_on_sale', False): tags.append("🟢На продаже")
+    if getattr(gift, 'is_on_auction', False): tags.append("🔨Аукцион")
+    if getattr(gift, 'is_locked', False): tags.append("🔒Занят")
+    if getattr(gift, 'is_crafted', False): tags.append("⚗️Крафт")
+    if getattr(gift, 'is_on_sale', False) and getattr(gift, 'is_on_auction', False): tags.append("🧬Гибрид")
+    if not tags: tags.append("🆓Свободен")
+
+    msg = f"""🎁 <b>{coll} #{number}</b>
+💵 Цена: <b>{price:.2f} TON</b>
+🧸 Модель: {model} {f'({model_r:.1f}%)' if model_r else ''}
+🎨 Фон: {backdrop} {f'({back_r:.1f}%)' if back_r else ''}
+🔣 Символ: {symbol} {f'({sym_r:.1f}%)' if sym_r else ''}
+
+📊 Статус: {', '.join(tags)}
+
+🔗 <a href="https://t.me/nft/{coll.replace(' ','')}-{number}">Открыть в Telegram</a>
+🏪 Маркет: MRKT
+
+#️⃣ ID: <code>{getattr(gift,'id','')}</code>
+"""
+    return msg, price
+
+# === TELEGRAM BOT ===
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await storage.add_chat(message.chat.id, message.from_user.username or "")
+    cfg = load_config()
+    await message.answer(f"""👋 Привет! Ты подписался на уведомления.
+
+🎯 Сейчас ищу подарки в диапазоне: <b>{cfg.get('min_price')} - {cfg.get('max_price')} TON</b>
+
+Команды:
+/setprice 0.5 10 - поставить свой диапазон
+/status - показать текущие настройки
+/stop - отписаться
+
+Я пришлю уведомление как только найду подходящий подарок!
+""", parse_mode="HTML")
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message):
+    await storage.remove_chat(message.chat.id)
+    await message.answer("❌ Отписал тебя от уведомлений. /start чтобы снова подписаться")
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    cfg = load_config()
+    chats = await storage.get_all_chats()
+    await message.answer(f"""📊 Текущие настройки:
+
+💰 Цена: {cfg.get('min_price')} - {cfg.get('max_price')} TON
+📦 Коллекции: {cfg.get('collections') or 'все'}
+🧸 Модели: {cfg.get('models') or 'все'}
+🎨 Фоны: {cfg.get('backdrops') or 'все'}
+🔣 Символы: {cfg.get('symbols') or 'все'}
+🏷 Статус: {cfg.get('status_filter', {}).get('allowed')}
+⏱ Интервал: {cfg.get('check_interval')} сек
+👥 Подписчиков: {len(chats)}
+""")
+
+@dp.message(Command("setprice"))
+async def cmd_setprice(message: Message):
+    try:
+        parts = message.text.split()
+        if len(parts) < 3:
+            await message.answer("Используй: /setprice 0.5 10\nГде 0.5 = мин цена, 10 = макс цена в TON")
+            return
+        min_p = float(parts[1])
+        max_p = float(parts[2])
+        if min_p < 0 or max_p < min_p:
+            await message.answer("❌ Неверный диапазон. Пример: /setprice 1 20")
+            return
+        
+        cfg = load_config()
+        cfg['min_price'] = min_p
+        cfg['max_price'] = max_p
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            yaml.dump(cfg, f, allow_unicode=True)
+        
+        await message.answer(f"✅ Диапазон обновлен: <b>{min_p} - {max_p} TON</b>\nТеперь ищу только в этом диапазоне!", parse_mode="HTML")
+        logger.info(f"Цена изменена пользователем {message.chat.id}: {min_p}-{max_p}")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}\nПример: /setprice 0.5 15")
+
+# === ФОНОВАЯ ЗАДАЧА ПАРСИНГА ===
+async def parser_loop():
+    await asyncio.sleep(2)
+    logger.info("🚀 Запускаю парсер-луп...")
+
+    # Создаем клиент MRKT с твоими API_ID/HASH - он сам получит токен
+    async with MarketClient(api_id=API_ID, api_hash=API_HASH, session_name="simple_parser") as market_client:
+        logger.info("✅ Подключился к MRKT через Telethon")
+
+        while True:
+            try:
+                cfg = load_config()
+                allowed = cfg.get("status_filter", {}).get("allowed", ["any"])
+
+                gifts = await search_gifts(market_client, cfg)
+                logger.info(f"Найдено {len(gifts)} подарков от MRKT в диапазоне {cfg.get('min_price')}-{cfg.get('max_price')} TON")
+
+                all_chats = await storage.get_all_chats()
+                # Добавляем ADMIN_CHAT_ID если он есть в .env
+                if ADMIN_CHAT_ID and ADMIN_CHAT_ID.isdigit():
+                    try:
+                        all_chats.append(int(ADMIN_CHAT_ID))
+                    except:
+                        pass
+                all_chats = list(set(all_chats))
+
+                if not all_chats:
+                    logger.info("Нет подписчиков, жду /start...")
+                    await asyncio.sleep(cfg.get("check_interval", 20))
+                    continue
+
+                for gift in gifts:
+                    gid = str(getattr(gift, 'id', ''))
+                    if not gid:
+                        continue
+                    if await storage.is_seen(gid):
+                        continue
+
+                    # Проверка статуса (занят / на продаже / гибрид)
+                    if not gift_matches_status(gift, allowed):
+                        await storage.mark_seen(gid)
+                        continue
+
+                    msg, price = format_gift_msg(gift)
+                    
+                    # Отправляем всем подписчикам
+                    for chat_id in all_chats:
+                        try:
+                            await bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", disable_web_page_preview=False)
+                            await asyncio.sleep(0.3)
+                        except Exception as e:
+                            logger.warning(f"Не смог отправить в {chat_id}: {e}")
+
+                    await storage.mark_seen(gid)
+                    logger.info(f"Отправил {gift.id} за {price:.2f} TON")
+
+                await asyncio.sleep(cfg.get("check_interval", 20))
+
+            except Exception as e:
+                logger.error(f"Ошибка в лупe: {e}", exc_info=True)
+                await asyncio.sleep(10)
+
+async def main():
+    await storage.init()
+
+    # Если есть ADMIN_CHAT_ID - добавляем его в базу
+    if ADMIN_CHAT_ID and ADMIN_CHAT_ID.lstrip('-').isdigit():
+        await storage.add_chat(int(ADMIN_CHAT_ID), "admin")
+        logger.info(f"Admin chat {ADMIN_CHAT_ID} добавлен")
+
+    # Запускаем парсер в фоне
+    asyncio.create_task(parser_loop())
+
+    logger.info(f"🤖 Бот запущен! Токен {BOT_TOKEN[:10]}... Цена {load_config().get('min_price')}-{load_config().get('max_price')} TON")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    print("""
+╔════════════════════════════════════════════╗
+║  ПРОСТОЙ ПАРСЕР ПО ЦЕНЕ                    ║
+║  Только min_price / max_price              ║
+║  Команды в ТГ: /start /setprice /status    ║
+╚════════════════════════════════════════════╝
+    """)
+    asyncio.run(main())
